@@ -1,4 +1,4 @@
-# ZIP-RC spinoff
+<h1 align="center">ZIP-RC replication</h1>
 
 <p align="center">
   <img src="assets/peony.png" width="800">
