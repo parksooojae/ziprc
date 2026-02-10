@@ -2,26 +2,28 @@ import modal
 
 app = modal.App("ziprc-train")
 
-project_mount = modal.Mount.from_local_dir(".", remote_path="/root/ziprc")
-
 image = (
-    modal.Image.debian_slim(python_version="3.11")
+    modal.Image.from_registry(
+        "nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11"
+    )
+    .entrypoint([])
     .pip_install(
         "torch",
         "transformers",
         "datasets",
         "accelerate",
         "wandb",
+        "vllm",
     )
+    .add_local_dir(".", remote_path="/root/ziprc")
 )
 
 
 @app.function(
     image=image,
     gpu="T4",
-    timeout=3600,
-    secrets=[modal.Secret.from_name("wandb-secret")],
-    mounts=[project_mount],
+    timeout=5400,
+    secrets=[modal.Secret.from_name("wandb-secret"), modal.Secret.from_name("huggingface-secret")],
 )
 def train(
     model_name: str = "Qwen/Qwen2.5-0.5B",
@@ -63,49 +65,52 @@ def train(
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
-
     dataset = prep_gsm8k()["train"]
     num_prompts = min(max_prompts, len(dataset))
 
-    # === Phase 1: Generate on-policy rollouts ===
+    # === Phase 1: Generate on-policy rollouts with vLLM ===
     # Paper Section 6.1: "For each prompt, we generate two on-policy rollouts
     # per model ... We then label each rollout for correctness."
-    print(f"Generating {num_rollouts} on-policy rollouts per prompt ({num_prompts}/{len(dataset)} prompts)...")
-    model.eval()
+    print(f"Generating {num_rollouts} on-policy rollouts per prompt ({num_prompts}/{len(dataset)} prompts) with vLLM...")
+    import os
+    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+    from vllm import LLM, SamplingParams
+
+    llm = LLM(model=model_name, dtype="float16")
+    sampling_params = SamplingParams(
+        temperature=1.0,
+        max_tokens=max_length,
+        n=num_rollouts,
+    )
+
+    prompts = [dataset[i]["prompt"] for i in range(num_prompts)]
+    answers = [dataset[i]["answer"] for i in range(num_prompts)]
+    vllm_outputs = llm.generate(prompts, sampling_params)
+
     rollout_data = []
     num_correct = 0
-    with torch.no_grad():
-        for i in range(num_prompts):
-            prompt = dataset[i]["prompt"]
-            answer = dataset[i]["answer"]
-            input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-
-            for _ in range(num_rollouts):
-                output_ids = model.generate(
-                    input_ids,
-                    max_new_tokens=max_length,
-                    do_sample=True,
-                    temperature=1.0,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
-                gen_text = tokenizer.decode(
-                    output_ids[0][input_ids.shape[1]:], skip_special_tokens=True
-                )
-                r = compute_reward(gen_text, answer)
-                num_correct += int(r == 1.0)
-                rollout_data.append({
-                    "text": f"{prompt}\n{gen_text}",
-                    "reward": r,
-                })
-
-            if (i + 1) % 50 == 0:
-                print(f"  {i + 1}/{num_prompts} prompts done")
+    for i, output in enumerate(vllm_outputs):
+        for completion in output.outputs:
+            gen_text = completion.text
+            r = compute_reward(gen_text, answers[i])
+            num_correct += int(r == 1.0)
+            rollout_data.append({
+                "text": f"{prompts[i]}\n{gen_text}",
+                "reward": r,
+            })
 
     num_incorrect = len(rollout_data) - num_correct
     print(f"Generated {len(rollout_data)} rollouts ({num_correct} correct, {num_incorrect} incorrect)")
+
+    # Free vLLM GPU memory before loading HF model for training
+    del llm
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16).to(device)
 
     # === Phase 2: Train with KL regularization ===
     # Paper eq. 3: L(s_t) = L_aux(s_t) + α_KL · KL(π ∥ π_θ)
@@ -169,18 +174,18 @@ def train(
             ).to(device)
 
             outputs = model(**enc)
-            logits = outputs.logits  # [B, T, V]
+            logits = outputs.logits.float()  # [B, T, V] — cast to float32 for numerical stability
 
             # === KL loss (batched over all positions) ===
             # Paper eq. 3: KL(π ∥ π_θ) over V \ R (non-reserved vocab)
             with torch.no_grad():
-                ref_logits = ref_model(**enc).logits
+                ref_logits = ref_model(**enc).logits.float()
 
             cur_logits_for_kl = mask_reserved_tokens(logits.clone())
             ref_logits_for_kl = mask_reserved_tokens(ref_logits.clone())
-            ref_probs = F.softmax(ref_logits_for_kl.float(), dim=-1)
-            cur_log_probs = F.log_softmax(cur_logits_for_kl.float(), dim=-1)
-            kl_per_token = F.kl_div(cur_log_probs, ref_probs, reduction="none").sum(dim=-1)
+            ref_probs = F.softmax(ref_logits_for_kl, dim=-1)
+            cur_log_probs = F.log_softmax(cur_logits_for_kl, dim=-1)
+            kl_per_token = F.kl_div(cur_log_probs, ref_probs, log_target=False, reduction="none").nan_to_num(0.0).sum(dim=-1)
             kl_loss = (kl_per_token * enc.attention_mask).sum() / enc.attention_mask.sum()
 
             # === Supervised + Bellman loss (per-position) ===
@@ -250,6 +255,14 @@ def train(
         print(f"epoch {epoch} avg_loss {epoch_avg_loss:.4f}")
 
     wandb.finish()
+
+    # Push to Hugging Face Hub
+    hf_repo = "parksoojae/zip-rc-b"
+    print(f"Pushing model to {hf_repo}...")
+    model.push_to_hub(hf_repo)
+    tokenizer.push_to_hub(hf_repo)
+    print(f"Pushed to https://huggingface.co/{hf_repo}")
+
     return {"status": "complete", "epochs": epochs, "num_rollouts_generated": len(rollout_data)}
 
 
