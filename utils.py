@@ -138,6 +138,6 @@ def get_expected_length(joint_probs: torch.Tensor, device: torch.device = None) 
 def mask_reserved_tokens(logits: torch.Tensor, distribution_token_id: int = DEFAULT_DISTRIBUTION_TOKEN_ID, num_reward_states: int = 2) -> torch.Tensor:
 
     num_bins = get_num_bins(num_reward_states)
-    logits[..., distribution_token_id : distribution_token_id + num_bins] = float("-inf")
+    logits[..., distribution_token_id : distribution_token_id + num_bins] = -1e4
     return logits
 

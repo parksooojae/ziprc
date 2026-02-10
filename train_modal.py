@@ -110,12 +110,16 @@ def train(
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16).to(device)
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32).to(device)
+
+    # #region agent log — verify dtype fix
+    print(f"[DBG] model dtype={next(model.parameters()).dtype}")
+    # #endregion
 
     # === Phase 2: Train with KL regularization ===
     # Paper eq. 3: L(s_t) = L_aux(s_t) + α_KL · KL(π ∥ π_θ)
     # Frozen reference model provides π (original policy before training)
-    ref_model = copy.deepcopy(model)
+    ref_model = copy.deepcopy(model).half()
     ref_model.eval()
     for p in ref_model.parameters():
         p.requires_grad = False
@@ -183,9 +187,13 @@ def train(
 
             cur_logits_for_kl = mask_reserved_tokens(logits.clone())
             ref_logits_for_kl = mask_reserved_tokens(ref_logits.clone())
+            del ref_logits
             ref_probs = F.softmax(ref_logits_for_kl, dim=-1)
+            del ref_logits_for_kl
             cur_log_probs = F.log_softmax(cur_logits_for_kl, dim=-1)
+            del cur_logits_for_kl
             kl_per_token = F.kl_div(cur_log_probs, ref_probs, log_target=False, reduction="none").nan_to_num(0.0).sum(dim=-1)
+            del cur_log_probs, ref_probs
             kl_loss = (kl_per_token * enc.attention_mask).sum() / enc.attention_mask.sum()
 
             # === Supervised + Bellman loss (per-position) ===
@@ -241,6 +249,11 @@ def train(
                 "epoch": epoch,
                 "global_step": global_step,
             }, step=global_step)
+
+            # #region agent log — verify NaN fix
+            if step in (0, 1, 5, 10, 20):
+                print(f"[DBG] step={step} sup={sup_val} bellman={bellman_val} kl={kl_val} loss={loss_val}")
+            # #endregion
 
             if step % 10 == 0:
                 print(
