@@ -12,6 +12,6 @@ Big step-to-step drops might indicate the model 'knew' a trajectory was failing 
 
 - ZIP-RC: Repurpose unused vocabulary logits for auxiliary predictions to joint distribution over (reward, remaining_length). Uses these predictions to adaptively allocate compute
 
-- ⭐ ZIP-RC-B: Add temporal consistency constraint to enforce V(s<sub>t</sub>) ≈ γ·V(s<sub>t+1</sub>)
+- ⭐ ZIP-RC-B(ellman): Add temporal consistency constraint to enforce V(s<sub>t</sub>) ≈ γ·V(s<sub>t+1</sub>)
 
 

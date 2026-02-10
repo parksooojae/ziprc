@@ -141,4 +141,3 @@ def mask_reserved_tokens(logits: torch.Tensor, distribution_token_id: int = DEFA
     logits[..., distribution_token_id : distribution_token_id + num_bins] = float("-inf")
     return logits
 
-
