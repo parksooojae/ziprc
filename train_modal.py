@@ -32,10 +32,10 @@ def train(
     batch_size: int = 1,
     max_length: int = 512,
     gamma: float = 0.99,
-    bellman_weight: float = 0.1,
+    bellman_weight: float = 0.01,
     alpha_kl: float = 10.0,
-    num_rollouts: int = 2,
-    max_prompts: int = 200,
+    num_rollouts: int = 4,
+    max_prompts: int = 500,
 ):
     import sys
     sys.path.insert(0, "/root/ziprc")
@@ -49,8 +49,6 @@ def train(
 
     from utils import (
         extract_joint_logits,
-        get_joint_probs,
-        get_expected_reward,
         get_num_bins,
         mask_reserved_tokens,
         compute_reward_bin_edges,
@@ -78,7 +76,7 @@ def train(
 
     llm = LLM(model=model_name, dtype="float16")
     sampling_params = SamplingParams(
-        temperature=1.0,
+        temperature=0.8,
         max_tokens=max_length,
         n=num_rollouts,
     )
@@ -119,7 +117,7 @@ def train(
     # === Phase 2: Train with KL regularization ===
     # Paper eq. 3: L(s_t) = L_aux(s_t) + α_KL · KL(π ∥ π_θ)
     # Frozen reference model provides π (original policy before training)
-    ref_model = copy.deepcopy(model).half()
+    ref_model = copy.deepcopy(model)
     ref_model.eval()
     for p in ref_model.parameters():
         p.requires_grad = False
@@ -230,12 +228,12 @@ def train(
                 )  # [B*(T-1)]
                 sup_loss = (ce_per_pos * valid_mask.reshape(-1).float()).sum() / num_positions
 
-                # Bellman loss: MSE between v[t] and gamma * v[t+1]
-                joint_probs_all = get_joint_probs(logits[:, :-1, :])  # [B, T-1, 2, NUM_LENGTH_BINS]
-                v_all = get_expected_reward(joint_probs_all)  # [B, T-1]
+                # Bellman loss: MSE between joint logits at t and t+1
+                logits_t = extract_joint_logits(logits[:, :-2, :])   # [B, T-2, num_bins]
+                logits_t1 = extract_joint_logits(logits[:, 1:-1, :]) # [B, T-2, num_bins]
 
                 bellman_mask = positions[:-1].unsqueeze(0) < (seq_lens.unsqueeze(1) - 2)  # [B, T-2]
-                bellman_per_pos = (v_all[:, :-1] - gamma * v_all[:, 1:].detach()) ** 2  # [B, T-2]
+                bellman_per_pos = (logits_t - logits_t1.detach()).pow(2).mean(dim=-1)  # [B, T-2]
                 bellman_loss = (bellman_per_pos * bellman_mask.float()).sum() / bellman_mask.sum().clamp(min=1)
             else:
                 sup_loss = 0.0
@@ -246,6 +244,7 @@ def train(
 
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
             loss_val = loss.item()
@@ -301,7 +300,7 @@ def main(
     epochs: int = 1,
     batch_size: int = 1,
     max_length: int = 512,
-    max_prompts: int = 200,
+    max_prompts: int = 500,
 ):
     result = train.remote(
         model_name=model_name,
