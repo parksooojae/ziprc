@@ -48,12 +48,12 @@ def train(
     import wandb
 
     from utils import (
-        get_joint_bin,
         extract_joint_logits,
         get_joint_probs,
         get_expected_reward,
         get_num_bins,
         mask_reserved_tokens,
+        compute_reward_bin_edges,
         NUM_LENGTH_BINS,
         DEFAULT_DISTRIBUTION_TOKEN_ID,
         LENGTH_BINS,
@@ -196,35 +196,50 @@ def train(
             del cur_log_probs, ref_probs
             kl_loss = (kl_per_token * enc.attention_mask).sum() / enc.attention_mask.sum()
 
-            # === Supervised + Bellman loss (per-position) ===
+            # === Supervised + Bellman loss (vectorized) ===
             B, T, V = logits.shape
-            sup_loss = 0.0
-            bellman_loss = 0.0
-            num_positions = 0
+            seq_lens = enc.attention_mask.sum(dim=-1)  # [B]
 
-            for b in range(B):
-                seq_len = enc.attention_mask[b].sum().item()
-                r = rewards[b]
-
-                for t in range(int(seq_len) - 1):
-                    tokens_remaining = seq_len - t - 1
-
-                    target_bin = get_joint_bin(tokens_remaining, r)
-                    joint_logits = extract_joint_logits(logits[b, t].unsqueeze(0))
-                    sup_loss += F.cross_entropy(joint_logits, torch.tensor([target_bin], device=device))
-
-                    if t < seq_len - 2:
-                        probs_t = get_joint_probs(logits[b, t].unsqueeze(0))
-                        probs_t1 = get_joint_probs(logits[b, t + 1].unsqueeze(0))
-                        v_t = get_expected_reward(probs_t)
-                        v_t1 = get_expected_reward(probs_t1).detach()
-                        bellman_loss += (v_t - gamma * v_t1) ** 2
-
-                    num_positions += 1
+            positions = torch.arange(T - 1, device=device)  # [T-1]
+            valid_mask = positions.unsqueeze(0) < (seq_lens.unsqueeze(1) - 1)  # [B, T-1]
+            num_positions = valid_mask.sum().item()
 
             if num_positions > 0:
-                sup_loss = sup_loss / num_positions
-                bellman_loss = bellman_loss / num_positions
+                # tokens_remaining[b, t] = seq_lens[b] - t - 1
+                tokens_remaining = seq_lens.unsqueeze(1) - positions.unsqueeze(0) - 1  # [B, T-1]
+                tokens_remaining = tokens_remaining.clamp(min=0)
+
+                # Vectorized get_joint_bin
+                length_boundaries = torch.tensor(LENGTH_BINS[1:], device=device)
+                length_bins = torch.bucketize(tokens_remaining, length_boundaries, right=True)
+                length_bins = length_bins.clamp(max=NUM_LENGTH_BINS - 1)
+
+                rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=device)  # [B]
+                reward_edges = compute_reward_bin_edges(DEFAULT_REWARD_VALUES)
+                reward_boundaries = torch.tensor(reward_edges[1:-1], dtype=torch.float32, device=device)
+                reward_bins = torch.bucketize(rewards_tensor, reward_boundaries, right=True)  # [B]
+
+                target_bins = length_bins + reward_bins.unsqueeze(1) * NUM_LENGTH_BINS  # [B, T-1]
+
+                # Supervised cross-entropy over joint distribution logits
+                joint_logits_all = extract_joint_logits(logits[:, :-1, :])  # [B, T-1, num_bins]
+                ce_per_pos = F.cross_entropy(
+                    joint_logits_all.reshape(-1, joint_logits_all.shape[-1]),
+                    target_bins.reshape(-1),
+                    reduction='none',
+                )  # [B*(T-1)]
+                sup_loss = (ce_per_pos * valid_mask.reshape(-1).float()).sum() / num_positions
+
+                # Bellman loss: MSE between v[t] and gamma * v[t+1]
+                joint_probs_all = get_joint_probs(logits[:, :-1, :])  # [B, T-1, 2, NUM_LENGTH_BINS]
+                v_all = get_expected_reward(joint_probs_all)  # [B, T-1]
+
+                bellman_mask = positions[:-1].unsqueeze(0) < (seq_lens.unsqueeze(1) - 2)  # [B, T-2]
+                bellman_per_pos = (v_all[:, :-1] - gamma * v_all[:, 1:].detach()) ** 2  # [B, T-2]
+                bellman_loss = (bellman_per_pos * bellman_mask.float()).sum() / bellman_mask.sum().clamp(min=1)
+            else:
+                sup_loss = 0.0
+                bellman_loss = 0.0
 
             # Paper eq. 3: L = L_aux + α_KL · KL  (+ your bellman term)
             loss = sup_loss + bellman_weight * bellman_loss + alpha_kl * kl_loss
